@@ -103,11 +103,13 @@ pub(super) fn xkb_names_for_rdp_keyboard_layout(keyboard_layout: u32) -> Option<
     })
 }
 
-/// Evdev keycode + required modifier (e.g. Shift) for a Unicode character.
+/// Evdev keycode + required modifiers (Shift and/or AltGr) for a Unicode character.
 #[derive(Clone, Copy)]
 pub(super) struct UnicodeKeyMapping {
     pub(super) evdev_key: u32,
     pub(super) needs_shift: bool,
+    /// AltGr (ISO_Level3_Shift, the right Alt key): levels 2 and 3 of a four-level key.
+    pub(super) needs_altgr: bool,
 }
 
 /// Modifier and layout snapshot in the shape of
@@ -311,13 +313,19 @@ fn build_unicode_to_keycode(keymap: &xkb::Keymap) -> HashMap<u16, UnicodeKeyMapp
         for layout in 0..num_layouts {
             let num_levels = keymap.num_levels_for_key(keycode, layout);
             for level in 0..num_levels {
+                // Level 0 = plain, 1 = Shift, 2 = AltGr, 3 = AltGr+Shift. Higher levels need
+                // other modifiers we do not synthesize: skip them rather than type the wrong key.
+                if level > 3 {
+                    continue;
+                }
                 let syms = keymap.key_get_syms_by_level(keycode, layout, level);
                 for sym in syms {
                     let ch = xkb::keysym_to_utf32(*sym);
                     if ch > 0 && ch <= u32::from(u16::MAX) {
                         map.entry(ch as u16).or_insert(UnicodeKeyMapping {
                             evdev_key,
-                            needs_shift: level == 1, // level 1 = Shift
+                            needs_shift: level == 1 || level == 3,
+                            needs_altgr: level == 2 || level == 3,
                         });
                     }
                 }

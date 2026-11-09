@@ -19,6 +19,8 @@ use super::keymap;
 /// How long the actor waits for a command before servicing the transport.
 const SOCKET_PUMP_INTERVAL: Duration = Duration::from_secs(1);
 const LEFT_SHIFT_KEY: u32 = 42;
+/// Right Alt = AltGr (ISO_Level3_Shift) on layouts such as us-intl.
+const RIGHT_ALT_KEY: u32 = 100;
 
 /// Ordered initial-sync candidates from a compositor devices query:
 /// the main physical keyboard, if any, plus the remaining physical
@@ -60,29 +62,15 @@ pub(super) enum InputCommand {
 struct DepressedKeys {
     plain: Vec<u32>,
     modifiers: Vec<u32>,
-    unicode_shift_owners: Vec<u16>,
 }
 
 impl DepressedKeys {
     fn is_empty(&self) -> bool {
-        self.plain.is_empty() && self.modifiers.is_empty() && self.unicode_shift_owners.is_empty()
+        self.plain.is_empty() && self.modifiers.is_empty()
     }
 
     fn holds_modifier(&self, evdev_key: u32) -> bool {
         self.modifiers.contains(&evdev_key)
-    }
-
-    fn press_unicode_shift(&mut self, code_point: u16) {
-        if !self.unicode_shift_owners.contains(&code_point) {
-            self.unicode_shift_owners.push(code_point);
-        }
-    }
-
-    fn release_unicode_shift(&mut self, code_point: u16) -> bool {
-        let previous_len = self.unicode_shift_owners.len();
-        self.unicode_shift_owners
-            .retain(|&owner| owner != code_point);
-        self.unicode_shift_owners.len() != previous_len
     }
 
     fn press(&mut self, evdev_key: u32, modifier: bool) {
@@ -370,12 +358,7 @@ fn handle_rdp_event(
                     tracing::trace!(evdev_key, "Suppressed duplicate modifier press");
                     return;
                 }
-                let already_active =
-                    evdev_key == LEFT_SHIFT_KEY && !depressed.unicode_shift_owners.is_empty();
                 depressed.press(evdev_key, modifier);
-                if already_active {
-                    return;
-                }
                 sink.key(t, evdev_key, true);
                 if tracker.key(evdev_key, true) {
                     sink.modifiers(tracker.modifier_state());
@@ -393,9 +376,6 @@ fn handle_rdp_event(
                     return;
                 }
                 depressed.release(evdev_key, modifier);
-                if evdev_key == LEFT_SHIFT_KEY && !depressed.unicode_shift_owners.is_empty() {
-                    return;
-                }
                 sink.key(t, evdev_key, false);
                 if tracker.key(evdev_key, false) {
                     sink.modifiers(tracker.modifier_state());
@@ -414,41 +394,39 @@ fn handle_rdp_event(
             sink.flush();
         }
         KeyboardEvent::UnicodePressed(code_point) => {
+            // A Unicode event is a typed character, not a held key: some clients (Guacamole's
+            // guacd) send only the press and never the release, which used to leave the key and
+            // AltGr/Shift stuck down. So type it as a complete tap right here.
             if let Some(mapping) = tracker.unicode_to_evdev(code_point) {
-                if mapping.needs_shift {
-                    let shift_already_active = depressed.holds_modifier(LEFT_SHIFT_KEY)
-                        || !depressed.unicode_shift_owners.is_empty();
-                    depressed.press_unicode_shift(code_point);
-                    if !shift_already_active {
-                        sink.key(t, LEFT_SHIFT_KEY, true);
-                        if tracker.key(LEFT_SHIFT_KEY, true) {
+                let mut pressed_modifiers = Vec::with_capacity(2);
+                for (modifier, needed) in [
+                    (LEFT_SHIFT_KEY, mapping.needs_shift),
+                    (RIGHT_ALT_KEY, mapping.needs_altgr),
+                ] {
+                    // Never touch a modifier the user is already holding.
+                    if needed && !depressed.holds_modifier(modifier) {
+                        sink.key(t, modifier, true);
+                        if tracker.key(modifier, true) {
                             sink.modifiers(tracker.modifier_state());
                         }
+                        pressed_modifiers.push(modifier);
                     }
                 }
                 sink.key(t, mapping.evdev_key, true);
-                depressed.press(mapping.evdev_key, false);
+                sink.key(t, mapping.evdev_key, false);
+                for modifier in pressed_modifiers.into_iter().rev() {
+                    sink.key(t, modifier, false);
+                    if tracker.key(modifier, false) {
+                        sink.modifiers(tracker.modifier_state());
+                    }
+                }
                 sink.flush();
             } else {
                 tracing::trace!(code_point, "No evdev mapping for Unicode character");
             }
         }
-        KeyboardEvent::UnicodeReleased(code_point) => {
-            if let Some(mapping) = tracker.unicode_to_evdev(code_point) {
-                sink.key(t, mapping.evdev_key, false);
-                depressed.release(mapping.evdev_key, false);
-                if mapping.needs_shift
-                    && depressed.release_unicode_shift(code_point)
-                    && depressed.unicode_shift_owners.is_empty()
-                    && !depressed.holds_modifier(LEFT_SHIFT_KEY)
-                {
-                    sink.key(t, LEFT_SHIFT_KEY, false);
-                    if tracker.key(LEFT_SHIFT_KEY, false) {
-                        sink.modifiers(tracker.modifier_state());
-                    }
-                }
-                sink.flush();
-            }
+        KeyboardEvent::UnicodeReleased(_) => {
+            // The tap was completed on press; clients that do send a release need no action.
         }
     }
 }
@@ -459,20 +437,12 @@ fn release_depressed(
     sink: &mut impl KeyboardSink,
     t: u32,
 ) -> usize {
-    let unicode_shift_only =
-        !depressed.unicode_shift_owners.is_empty() && !depressed.holds_modifier(LEFT_SHIFT_KEY);
     let mut released = 0;
     for evdev_key in depressed.release_all() {
         sink.key(t, evdev_key, false);
         tracker.key(evdev_key, false);
         released += 1;
     }
-    if unicode_shift_only {
-        sink.key(t, LEFT_SHIFT_KEY, false);
-        tracker.key(LEFT_SHIFT_KEY, false);
-        released += 1;
-    }
-    depressed.unicode_shift_owners.clear();
     released
 }
 
@@ -595,24 +565,16 @@ mod tests {
             ],
         );
 
-        let release_suffix = &calls[calls.len() - 6..];
+        let release_suffix = &calls[calls.len() - 4..];
         assert_eq!(
             release_suffix,
             [
-                SinkCall::Key {
-                    evdev_key: 30,
-                    pressed: false,
-                },
                 SinkCall::Key {
                     evdev_key: 28,
                     pressed: false,
                 },
                 SinkCall::Key {
                     evdev_key: 29,
-                    pressed: false,
-                },
-                SinkCall::Key {
-                    evdev_key: LEFT_SHIFT_KEY,
                     pressed: false,
                 },
                 SinkCall::Modifiers(KeyboardModifierState::default()),
@@ -872,35 +834,9 @@ mod tests {
     }
 
     #[test]
-    fn physical_shift_release_keeps_unicode_owned_shift() {
+    fn unicode_press_types_a_full_tap_each_time() {
         let mut tracker = tracker();
-        let calls = run(
-            &mut tracker,
-            vec![
-                InputCommand::Keyboard(KeyboardEvent::UnicodePressed('A' as u16)),
-                InputCommand::Keyboard(KeyboardEvent::Pressed {
-                    code: 0x2a,
-                    extended: false,
-                }),
-                InputCommand::Keyboard(KeyboardEvent::UnicodeReleased('A' as u16)),
-                InputCommand::Keyboard(KeyboardEvent::Released {
-                    code: 0x2a,
-                    extended: false,
-                }),
-            ],
-        );
-
-        let key_calls = key_calls(&calls);
-        assert_eq!(
-            key_calls,
-            vec![(42, true), (30, true), (30, false), (42, false)]
-        );
-        assert_eq!(tracker.modifier_state().depressed, 0);
-    }
-
-    #[test]
-    fn unicode_shift_repeat_press_single_release_neutralizes() {
-        let mut tracker = tracker();
+        // A repeated press is two characters; a trailing release changes nothing.
         let calls = run(
             &mut tracker,
             vec![
@@ -910,16 +846,24 @@ mod tests {
             ],
         );
 
-        let key_calls = key_calls(&calls);
         assert_eq!(
-            key_calls,
-            vec![(42, true), (30, true), (30, true), (30, false), (42, false),]
+            key_calls(&calls),
+            vec![
+                (42, true),
+                (30, true),
+                (30, false),
+                (42, false),
+                (42, true),
+                (30, true),
+                (30, false),
+                (42, false),
+            ]
         );
         assert_eq!(tracker.modifier_state().depressed, 0);
     }
 
     #[test]
-    fn unicode_shift_waits_for_all_distinct_owners() {
+    fn unicode_distinct_chars_are_independent_taps() {
         let mut tracker = tracker();
         let calls = run(
             &mut tracker,
@@ -931,14 +875,15 @@ mod tests {
             ],
         );
 
-        let key_calls = key_calls(&calls);
         assert_eq!(
-            key_calls,
+            key_calls(&calls),
             vec![
                 (42, true),
                 (30, true),
-                (48, true),
                 (30, false),
+                (42, false),
+                (42, true),
+                (48, true),
                 (48, false),
                 (42, false),
             ]
