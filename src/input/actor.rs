@@ -1460,6 +1460,132 @@ mod tests {
         assert_eq!(tracker.modifier_state().depressed, 0);
     }
 
+    fn intl_tracker() -> KeyboardStateTracker {
+        let keymap = generate_xkb_keymap_from_names(&XkbKeymapNames {
+            layout: Some("us".into()),
+            variant: Some("intl".into()),
+            ..Default::default()
+        })
+        .expect("us intl keymap compiles");
+        KeyboardStateTracker::new(&keymap).expect("keymap loads")
+    }
+
+    fn unicode_press(code_point: u16) -> InputCommand {
+        InputCommand::Keyboard(KeyboardEvent::UnicodePressed(code_point))
+    }
+
+    #[test]
+    fn unicode_altgr_char_is_a_tap_wrapped_in_right_alt() {
+        let mut tracker = intl_tracker();
+        // a with acute is AltGr+a on us-intl.
+        let calls = run(&mut tracker, vec![unicode_press(0x00e1)]);
+        assert_eq!(
+            key_calls(&calls),
+            vec![(100, true), (30, true), (30, false), (100, false)]
+        );
+        assert_eq!(tracker.modifier_state().depressed, 0);
+    }
+
+    #[test]
+    fn unicode_altgr_shift_char_presses_shift_then_altgr_and_releases_in_reverse() {
+        let mut tracker = intl_tracker();
+        // A with acute is AltGr+Shift+a.
+        let calls = run(&mut tracker, vec![unicode_press(0x00c1)]);
+        assert_eq!(
+            key_calls(&calls),
+            vec![
+                (42, true),
+                (100, true),
+                (30, true),
+                (30, false),
+                (100, false),
+                (42, false)
+            ]
+        );
+        assert_eq!(tracker.modifier_state().depressed, 0);
+    }
+
+    #[test]
+    fn unicode_plain_char_does_not_touch_modifiers() {
+        let mut tracker = intl_tracker();
+        let calls = run(&mut tracker, vec![unicode_press('a' as u16)]);
+        assert_eq!(key_calls(&calls), vec![(30, true), (30, false)]);
+    }
+
+    /// Guacamole's guacd sends a Unicode character as a press and never a release. The key and
+    /// AltGr used to stay down, so the following plain keys came out as AltGr characters
+    /// ("aaaa" repeating, then every letter accented).
+    #[test]
+    fn unicode_press_without_release_leaves_nothing_held() {
+        let mut tracker = intl_tracker();
+        let calls = run(
+            &mut tracker,
+            vec![
+                unicode_press(0x00e1),
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x30, // b
+                    extended: false,
+                }),
+                InputCommand::Keyboard(KeyboardEvent::Released {
+                    code: 0x30,
+                    extended: false,
+                }),
+            ],
+        );
+        assert_eq!(
+            key_calls(&calls),
+            vec![
+                (100, true),
+                (30, true),
+                (30, false),
+                (100, false),
+                (48, true),
+                (48, false)
+            ]
+        );
+        assert_eq!(tracker.modifier_state().depressed, 0);
+    }
+
+    #[test]
+    fn unicode_release_alone_does_nothing() {
+        let mut tracker = intl_tracker();
+        let calls = run(
+            &mut tracker,
+            vec![InputCommand::Keyboard(KeyboardEvent::UnicodeReleased(
+                0x00e1,
+            ))],
+        );
+        assert!(key_calls(&calls).is_empty());
+    }
+
+    #[test]
+    fn unicode_altgr_char_leaves_a_held_physical_right_alt_alone() {
+        let mut tracker = intl_tracker();
+        let right_alt = |pressed| {
+            InputCommand::Keyboard(if pressed {
+                KeyboardEvent::Pressed {
+                    code: 0x38,
+                    extended: true,
+                }
+            } else {
+                KeyboardEvent::Released {
+                    code: 0x38,
+                    extended: true,
+                }
+            })
+        };
+        let calls = run(
+            &mut tracker,
+            vec![right_alt(true), unicode_press(0x00e1), right_alt(false)],
+        );
+        // The user's own AltGr is pressed once and released once; the tap adds no AltGr events.
+        assert_eq!(
+            key_calls(&calls),
+            vec![(100, true), (30, true), (30, false), (100, false)]
+        );
+        assert_eq!(tracker.modifier_state().depressed, 0);
+    }
+
     #[test]
     fn unicode_shift_sequence_preserves_order() {
         let mut tracker = tracker();

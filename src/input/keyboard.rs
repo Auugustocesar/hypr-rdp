@@ -446,6 +446,34 @@ mod tests {
         assert_eq!(xkb_names_for_rdp_keyboard_layout(0x0000ffff), None);
     }
 
+    fn intl_tracker() -> KeyboardStateTracker {
+        let keymap = generate_xkb_keymap_from_names(&XkbKeymapNames {
+            layout: Some("us".into()),
+            variant: Some("intl".into()),
+            ..Default::default()
+        })
+        .expect("us intl keymap compiles");
+        KeyboardStateTracker::new(&keymap).expect("keymap loads")
+    }
+
+    #[test]
+    fn unicode_lookup_marks_altgr_levels_in_us_intl() {
+        let tracker = intl_tracker();
+        let flags = |ch: char| {
+            let m = tracker
+                .unicode_to_evdev(ch as u16)
+                .unwrap_or_else(|| panic!("{ch} has no mapping"));
+            (m.evdev_key, m.needs_shift, m.needs_altgr)
+        };
+
+        assert_eq!(flags('a'), (30, false, false));
+        assert_eq!(flags('A'), (30, true, false));
+        // Level 2 (AltGr) and level 3 (AltGr+Shift) of the same physical key.
+        assert_eq!(flags('\u{e1}'), (30, false, true)); // a with acute
+        assert_eq!(flags('\u{c1}'), (30, true, true)); // A with acute
+        assert_eq!(flags('\u{e7}'), (51, false, true)); // c with cedilla (AltGr+comma)
+    }
+
     #[test]
     fn rdp_keyboard_layout_generated_keymap_affects_unicode_lookup() {
         let names = xkb_names_for_rdp_keyboard_layout(0x00000407).expect("German HKL is supported");
