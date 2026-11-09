@@ -236,7 +236,9 @@ pub fn output_create_headless(name: &str) -> Result<()> {
 ///
 /// Hyprland's new (Lua) config parser rejects `keyword` with
 /// "keyword can't work with non-legacy parsers. Use eval."
-/// In that case, retry as `eval hl.monitor({...})`.
+/// Hyprland 0.57 and newer no longer register `keyword` on the socket at all
+/// and answer "unknown request" instead.
+/// In both cases, retry as `eval hl.monitor({...})`.
 pub fn keyword_monitor(rule: &str) -> Result<()> {
     match send_action(&format!("keyword monitor {}", rule)) {
         Ok(()) => Ok(()),
@@ -248,9 +250,10 @@ pub fn keyword_monitor(rule: &str) -> Result<()> {
 }
 
 fn is_non_legacy_parser_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().contains("non-legacy parsers"))
+    error.chain().any(|cause| {
+        let msg = cause.to_string();
+        msg.contains("non-legacy parsers") || msg.contains("unknown request")
+    })
 }
 
 fn monitor_rule_to_lua(rule: &str) -> Result<String> {
