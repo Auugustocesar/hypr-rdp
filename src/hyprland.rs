@@ -608,6 +608,14 @@ mod tests {
     }
 
     #[test]
+    fn non_legacy_parser_error_detection_matches_unknown_request() {
+        // Hyprland 0.57+ no longer registers `keyword` and answers like this.
+        let err = anyhow!("Hyprland IPC error: unknown request");
+
+        assert!(is_non_legacy_parser_error(&err));
+    }
+
+    #[test]
     fn non_legacy_parser_error_detection_ignores_other_errors() {
         let err = anyhow!("Hyprland IPC error: monitor rule failed");
 
